@@ -5,8 +5,15 @@ import http from 'http';
 import { getDb, waitForDb } from './db.js';
 import { processEvent, addTimelineEvent, addAuditLog, addAppNotification, cancelEscalation } from './engine/pipeline.js';
 import { checkRuleConflicts } from './engine/rules.js';
-import { dispatchNotifications } from './notifications/dispatcher.js';
 import { v4 as uuidv4 } from 'uuid';
+import {
+  generateAuthUrl as generateGmailAuthUrl,
+  handleOAuthCallback as handleGmailOAuthCallback,
+  getGmailStatus,
+  disconnectGmail,
+  sendGmailMessage,
+} from './connectors/gmail.js';
+import { sendDirectSlackMessage } from './connectors/slack.js';
 import {
   normalizeEmail,
   validateEmail,
@@ -1202,6 +1209,9 @@ app.post('/api/destinations/:id/test', requireAuth, async (req, res) => {
     } else if (dest.type === 'email') {
       const { sendEmailNotification } = await import('./notifications/email.js');
       result = await sendEmailNotification(config, template, testIncident, 'alert');
+    } else if (dest.type === 'gmail') {
+      const { sendGmailNotification } = await import('./notifications/gmail.js');
+      result = await sendGmailNotification(db, config, template, testIncident, 'alert');
     }
 
     if (result?.success) {
@@ -1225,6 +1235,172 @@ function maskUrl(url) {
     return url.substring(0, 30) + '...';
   }
 }
+
+// ==========================================
+// CONNECTORS (DIRECT GMAIL & SLACK)
+// ==========================================
+
+// List all connectors for organization (masked, no secrets)
+app.get('/api/connectors', requireAuth, (req, res) => {
+  const db = getDb();
+  const orgId = req.user?.organization_id || ORG_ID;
+  const connectors = db.prepare(`
+    SELECT id, organization_id, provider, name, account_id, account_email, status, last_error, metadata, created_at, updated_at
+    FROM connectors
+    WHERE organization_id = ?
+    ORDER BY created_at DESC
+  `).all(orgId);
+
+  res.json(connectors);
+});
+
+// Gmail connector status
+app.get('/api/connectors/gmail/status', requireAuth, (req, res) => {
+  const db = getDb();
+  const orgId = req.user?.organization_id || ORG_ID;
+  const status = getGmailStatus(db, orgId);
+  res.json({
+    ...status,
+    configured: Boolean(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET),
+  });
+});
+
+// Generate Gmail OAuth authorization URL
+app.get('/api/connectors/gmail/auth-url', requireAuth, (req, res) => {
+  const db = getDb();
+  const orgId = req.user?.organization_id || ORG_ID;
+  try {
+    const { authUrl, state, redirectUri } = generateGmailAuthUrl(
+      db,
+      req.user.id,
+      orgId,
+      { redirectUri: req.query.redirect_uri }
+    );
+    res.json({ authUrl, state, redirectUri });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// OAuth 2.0 callback endpoint for Google
+app.get('/api/connectors/gmail/callback', async (req, res) => {
+  const db = getDb();
+  const { code, state, error } = req.query;
+  const frontendBase = process.env.FRONTEND_URL || 'https://alertflow-two.vercel.app';
+
+  if (error) {
+    console.error(`[Gmail OAuth] Callback error received: ${error}`);
+    return res.redirect(`${frontendBase}/destinations?error=${encodeURIComponent(error)}`);
+  }
+
+  if (!code || !state) {
+    return res.redirect(`${frontendBase}/destinations?error=${encodeURIComponent('Missing OAuth code or state parameter')}`);
+  }
+
+  try {
+    const result = await handleGmailOAuthCallback(db, {
+      code,
+      state,
+      redirectUri: req.query.redirect_uri,
+    });
+
+    if (!result.success) {
+      console.error(`[Gmail OAuth] Exchange failed: ${result.error}`);
+      return res.redirect(`${frontendBase}/destinations?error=${encodeURIComponent(result.error || 'Failed to authenticate Gmail')}`);
+    }
+
+    addAuditLog(
+      db,
+      'connector_connected',
+      'connector',
+      result.connector.id,
+      result.connector.name,
+      `Gmail connector connected for ${result.connector.account_email}`,
+      result.connector.created_by_user_id || 'system',
+      'OAuth'
+    );
+    addAppNotification(
+      db,
+      'connector_connected',
+      'Gmail Connected',
+      `Gmail account (${result.connector.account_email}) connected successfully`,
+      'success'
+    );
+
+    res.redirect(`${frontendBase}/destinations?connected=gmail`);
+  } catch (err) {
+    console.error(`[Gmail OAuth] Exception in callback: ${err.message}`);
+    res.redirect(`${frontendBase}/destinations?error=${encodeURIComponent(err.message)}`);
+  }
+});
+
+// Disconnect Gmail connector
+app.post('/api/connectors/gmail/disconnect', requireAuth, requireAdmin, async (req, res) => {
+  const db = getDb();
+  const orgId = req.user?.organization_id || ORG_ID;
+  try {
+    const result = await disconnectGmail(db, orgId, req.body?.connector_id);
+    addAuditLog(
+      db,
+      'connector_disconnected',
+      'connector',
+      req.body?.connector_id || 'gmail',
+      'Gmail',
+      'Gmail connector disconnected',
+      req.user?.id,
+      req.user?.name
+    );
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Test Gmail connector sending
+app.post('/api/connectors/gmail/test', requireAuth, async (req, res) => {
+  const db = getDb();
+  const orgId = req.user?.organization_id || ORG_ID;
+
+  const connector = db.prepare(`
+    SELECT * FROM connectors
+    WHERE organization_id = ? AND provider = 'gmail' AND status = 'connected'
+    ORDER BY updated_at DESC LIMIT 1
+  `).get(orgId);
+
+  if (!connector) {
+    return res.status(400).json({ error: 'No active Gmail connector connected. Please connect Gmail first.' });
+  }
+
+  const recipient = req.body?.to || req.user?.email || connector.account_email;
+
+  try {
+    const result = await sendGmailMessage(db, connector, {
+      to: recipient,
+      subject: req.body?.subject || '🔔 AlertFlow Direct Gmail Connector Test',
+      plainText: req.body?.message || 'This is a test notification from AlertFlow confirming direct Gmail API connectivity.',
+      htmlText: `
+        <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 540px; margin: 0 auto; background: #0f172a; border: 1px solid #1e293b; border-radius: 10px; overflow: hidden; color: #f8fafc;">
+          <div style="background: #10b981; padding: 16px 20px;">
+            <h3 style="margin: 0; color: #ffffff; font-size: 16px;">✅ AlertFlow Direct Connector Active</h3>
+          </div>
+          <div style="padding: 20px;">
+            <p style="margin: 0 0 16px 0; color: #e2e8f0; font-size: 14px;">This test message confirms your Gmail account (<strong>${connector.account_email}</strong>) is connected directly to AlertFlow without intermediaries.</p>
+            <p style="margin: 0; color: #64748b; font-size: 12px;">Sent at: ${new Date().toISOString()}</p>
+          </div>
+        </div>
+      `,
+    });
+
+    if (result.success) {
+      db.prepare(`UPDATE connectors SET updated_at = ? WHERE id = ?`).run(new Date().toISOString(), connector.id);
+      db.save();
+    }
+
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
 
 // ==========================================
 // ==========================================

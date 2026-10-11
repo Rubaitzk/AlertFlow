@@ -1,6 +1,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import { sendSlackNotification } from './slack.js';
 import { sendEmailNotification } from './email.js';
+import { sendGmailNotification } from './gmail.js';
 import { getNotificationTemplate } from './templates.js';
 import { retryDelivery } from './retry.js';
 
@@ -33,7 +34,7 @@ export async function dispatchNotifications(db, incident, event, actions, notifi
   for (const dest of destinations) {
     // Check if this channel type is enabled for this severity
     if (dest.type === 'slack' && !channels.slack) continue;
-    if (dest.type === 'email' && !channels.email) continue;
+    if ((dest.type === 'email' || dest.type === 'gmail') && !channels.email) continue;
 
     const deliveryId = uuidv4();
     const template = getNotificationTemplate(notificationType, incident, event);
@@ -55,6 +56,8 @@ export async function dispatchNotifications(db, incident, event, actions, notifi
 
       if (dest.type === 'slack') {
         result = await sendSlackNotification(config, template, incident, event, notificationType);
+      } else if (dest.type === 'gmail') {
+        result = await sendGmailNotification(db, config, template, incident, notificationType);
       } else if (dest.type === 'email') {
         result = await sendEmailNotification(config, template, incident, notificationType);
       }
@@ -123,6 +126,8 @@ async function tryFallback(db, failedDest, allDestinations, template, incident, 
 
     if (fallback.type === 'slack') {
       result = await sendSlackNotification(config, template, incident, event, notificationType);
+    } else if (fallback.type === 'gmail') {
+      result = await sendGmailNotification(db, config, template, incident, notificationType);
     } else if (fallback.type === 'email') {
       result = await sendEmailNotification(config, template, incident, notificationType);
     }

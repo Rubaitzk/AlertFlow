@@ -1,5 +1,6 @@
 import { sendSlackNotification } from './slack.js';
 import { sendEmailNotification } from './email.js';
+import { sendGmailNotification } from './gmail.js';
 
 const MAX_RETRIES = 3;
 const RETRY_DELAYS = [2000, 5000, 10000]; // Exponential backoff
@@ -22,6 +23,8 @@ export async function retryDelivery(db, deliveryId, destination, template, incid
       let result;
       if (destination.type === 'slack') {
         result = await sendSlackNotification(config, template, incident, notificationType);
+      } else if (destination.type === 'gmail') {
+        result = await sendGmailNotification(db, config, template, incident, notificationType);
       } else if (destination.type === 'email') {
         result = await sendEmailNotification(config, template, incident, notificationType);
       }

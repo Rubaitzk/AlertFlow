@@ -103,6 +103,16 @@ export const api = {
   deleteDestination: (id) => request(`/destinations/${id}`, { method: 'DELETE' }),
   testDestination: (id) => request(`/destinations/${id}/test`, { method: 'POST', body: {} }),
 
+  // Direct Connectors (Gmail OAuth, Slack)
+  getConnectors: () => request('/connectors'),
+  getGmailConnectorStatus: () => request('/connectors/gmail/status'),
+  getGmailAuthUrl: (redirectUri) => {
+    const qs = redirectUri ? `?redirect_uri=${encodeURIComponent(redirectUri)}` : '';
+    return request(`/connectors/gmail/auth-url${qs}`);
+  },
+  disconnectGmail: (connectorId) => request('/connectors/gmail/disconnect', { method: 'POST', body: { connector_id: connectorId } }),
+  testGmailConnector: (data = {}) => request('/connectors/gmail/test', { method: 'POST', body: data }),
+
   // Rules
   getRules: () => request('/rules'),
   createRule: (data) => request('/rules', { method: 'POST', body: data }),

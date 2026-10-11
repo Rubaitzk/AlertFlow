@@ -394,6 +394,35 @@ function initSchema() {
       created_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
+
+    CREATE TABLE IF NOT EXISTS connectors (
+      id TEXT PRIMARY KEY,
+      organization_id TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      name TEXT,
+      account_id TEXT,
+      account_email TEXT,
+      encrypted_access_token TEXT,
+      encrypted_refresh_token TEXT,
+      token_expires_at TEXT,
+      scope TEXT,
+      status TEXT DEFAULT 'connected',
+      last_error TEXT,
+      metadata TEXT,
+      created_by_user_id TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS oauth_states (
+      state TEXT PRIMARY KEY,
+      provider TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      organization_id TEXT NOT NULL,
+      redirect_url TEXT,
+      expires_at TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
   `);
 
   // Migrate existing users table if columns are missing
@@ -417,6 +446,9 @@ function initSchema() {
     'CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at)',
     'CREATE INDEX IF NOT EXISTS idx_pwd_reset_user_id ON password_reset_tokens(user_id)',
     'CREATE INDEX IF NOT EXISTS idx_pwd_reset_token_hash ON password_reset_tokens(token_hash)',
+    'CREATE INDEX IF NOT EXISTS idx_connectors_org_provider ON connectors(organization_id, provider)',
+    'CREATE INDEX IF NOT EXISTS idx_connectors_email ON connectors(account_email)',
+    'CREATE INDEX IF NOT EXISTS idx_oauth_states_expires ON oauth_states(expires_at)',
   ];
   for (const idx of indexes) {
     try {

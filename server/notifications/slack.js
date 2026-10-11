@@ -1,21 +1,24 @@
+import { sendDirectSlackMessage } from '../connectors/slack.js';
+
 /**
- * Slack notification sender using Incoming Webhooks.
+ * Slack notification sender with direct Slack API & Incoming Webhook support.
  */
 export async function sendSlackNotification(config, template, incident, eventOrType = 'alert', maybeType, options = {}) {
   const notificationType = typeof eventOrType === 'string' ? eventOrType : (maybeType || 'alert');
   const event = typeof eventOrType === 'object' ? eventOrType : null;
   const testMode = options.testMode === true;
 
-  // Use the database configured webhook URL (which is wf_5c3b7b05a7ad)
+  // Primary: configured webhook URL or Slack Bot Token
   let webhookUrl = config.webhook_url;
+  const botToken = config.bot_token || process.env.SLACK_BOT_TOKEN;
 
-  // If webhookUrl is missing or still using the test one, fallback to the ingestion workflow
-  if (!webhookUrl || typeof webhookUrl !== 'string' || webhookUrl.includes('wf_9a9e07bc911b')) {
-    webhookUrl = process.env.FASTN_NOTIFICATION_WEBHOOK_URL || 'https://api.fastn.dev/api/v1/workflows/wf_5c3b7b05a7ad/execute';
+  // Fallback to environment variables if not specified in config
+  if (!webhookUrl && !botToken) {
+    webhookUrl = process.env.SLACK_WEBHOOK_URL || process.env.FASTN_NOTIFICATION_WEBHOOK_URL;
   }
 
-  if (!webhookUrl) {
-    return { success: false, error: 'No Slack webhook URL configured' };
+  if (!webhookUrl && !botToken) {
+    return { success: false, error: 'No Slack webhook URL or bot token configured' };
   }
 
   // Determine if we should simulate failure (for demo purposes)
@@ -92,6 +95,26 @@ export async function sendSlackNotification(config, template, incident, eventOrT
   const alertId = event?.alert_id || null;
   const timestamp = new Date().toISOString();
   const slackChannel = config.slack_channel || '#incidents';
+
+  // Direct Slack integration branch (Incoming Webhooks or Bot Token)
+  const isFastnWorkflow = typeof webhookUrl === 'string' && webhookUrl.includes('fastn.dev');
+  const isDirectSlack = Boolean(botToken || (webhookUrl && (webhookUrl.includes('hooks.slack.com') || !isFastnWorkflow)));
+
+  if (isDirectSlack) {
+    const directText = isRecovery
+      ? (template?.subject || `✅ [RESOLVED] ${incidentNumber}: ${incident?.title || template?.subject || `${service} — Incident Resolved`}`)
+      : (template?.subject || incident?.title || `${service} — ${event?.description || template?.description || 'Incident notification'}`);
+
+    console.log(`[Slack] Direct dispatch: botToken=${Boolean(botToken)} webhook=${webhookUrl ? webhookUrl.substring(0, 40) + '...' : 'none'} channel=${slackChannel} type=${notificationType}`);
+    return await sendDirectSlackMessage({
+      webhookUrl: isFastnWorkflow ? null : webhookUrl,
+      botToken,
+      channel: slackChannel,
+      text: directText,
+      blocks,
+      options: { simulateFailure: config.simulate_failure }
+    });
+  }
 
   let severity, value, threshold, source, event_type, description, status, title;
 
