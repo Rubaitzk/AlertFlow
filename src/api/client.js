@@ -1,24 +1,67 @@
-const API_BASE = '/api';
+const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api';
+
+const unauthorizedListeners = new Set();
+
+export function onUnauthorized(callback) {
+  unauthorizedListeners.add(callback);
+  return () => unauthorizedListeners.delete(callback);
+}
+
+function notifyUnauthorized() {
+  for (const listener of unauthorizedListeners) {
+    try {
+      listener();
+    } catch {}
+  }
+}
 
 async function request(path, options = {}) {
   const url = `${API_BASE}${path}`;
-  const config = {
-    headers: { 'Content-Type': 'application/json' },
-    ...options,
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-AlertFlow-Client': '1',
+    ...(options.headers || {}),
   };
+
+  const config = {
+    credentials: 'include',
+    ...options,
+    headers,
+  };
+
   if (config.body && typeof config.body === 'object') {
     config.body = JSON.stringify(config.body);
   }
 
   const res = await fetch(url, config);
+
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: 'Request failed' }));
-    throw new Error(err.error || `HTTP ${res.status}`);
+    const err = await res.json().catch(() => ({ error: `Request failed (${res.status})` }));
+
+    // Notify auth context on 401 Unauthorized for session expiration (except on /auth/me or /auth/login)
+    if (res.status === 401 && !path.startsWith('/auth/me') && !path.startsWith('/auth/login')) {
+      notifyUnauthorized();
+    }
+
+    const error = new Error(err.error || `HTTP ${res.status}`);
+    error.status = res.status;
+    error.data = err;
+    throw error;
   }
+
   return res.json();
 }
 
 export const api = {
+  // Authentication
+  login: (credentials) => request('/auth/login', { method: 'POST', body: credentials }),
+  register: (data) => request('/auth/register', { method: 'POST', body: data }),
+  logout: () => request('/auth/logout', { method: 'POST', body: {} }),
+  getMe: () => request('/auth/me'),
+  getAuthConfig: () => request('/auth/config'),
+  forgotPassword: (email) => request('/auth/forgot-password', { method: 'POST', body: { email } }),
+  resetPassword: (data) => request('/auth/reset-password', { method: 'POST', body: data }),
+
   // Dashboard
   getDashboard: () => request('/dashboard'),
 
@@ -106,34 +149,61 @@ export const api = {
 // WebSocket connection
 let ws = null;
 let wsListeners = new Set();
+let reconnectTimer = null;
+let shouldReconnect = true;
 
 export function connectWebSocket() {
-  if (ws) return;
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+
+  shouldReconnect = true;
+  clearTimeout(reconnectTimer);
 
   const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
-  const wsHost = isLocal
+  const configuredWsHost = import.meta.env.VITE_WS_HOST;
+  const wsHost = configuredWsHost || (isLocal
     ? `${window.location.hostname}:${window.location.port}`
-    : 'alertflow-backend-production.up.railway.app';
+    : 'alertflow-backend-production.up.railway.app');
+
   const protocol = isLocal && window.location.protocol !== 'https:' ? 'ws' : 'wss';
-  ws = new WebSocket(`${protocol}://${wsHost}/ws`);
 
-  ws.onmessage = (event) => {
-    try {
-      const data = JSON.parse(event.data);
-      for (const listener of wsListeners) {
-        listener(data);
+  try {
+    ws = new WebSocket(`${protocol}://${wsHost}/ws`);
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        for (const listener of wsListeners) {
+          listener(data);
+        }
+      } catch {}
+    };
+
+    ws.onclose = (event) => {
+      ws = null;
+      if (shouldReconnect && event.code !== 1008) {
+        reconnectTimer = setTimeout(connectWebSocket, 3000);
       }
+    };
+
+    ws.onerror = () => {
+      ws?.close();
+    };
+  } catch (err) {
+    console.error('[WS] Connection error:', err);
+  }
+}
+
+export function disconnectWebSocket() {
+  shouldReconnect = false;
+  clearTimeout(reconnectTimer);
+  if (ws) {
+    try {
+      ws.close(1000, 'User logged out');
     } catch {}
-  };
-
-  ws.onclose = () => {
     ws = null;
-    setTimeout(connectWebSocket, 3000);
-  };
-
-  ws.onerror = () => {
-    ws?.close();
-  };
+  }
 }
 
 export function onWsMessage(listener) {

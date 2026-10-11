@@ -5,7 +5,7 @@ import { fileURLToPath } from 'url';
 import { v4 as uuidv4 } from 'uuid';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DB_PATH = process.env.VERCEL ? path.join('/tmp', 'alertops.db') : path.join(__dirname, 'alertops.db');
+const DB_PATH = process.env.DB_PATH || (process.env.VERCEL ? path.join('/tmp', 'alertops.db') : path.join(__dirname, 'alertops.db'));
 
 let rawDb = null;
 let dbWrapper = null;
@@ -20,6 +20,10 @@ function createWrapper(db) {
     try {
       const data = db.export();
       const buffer = Buffer.from(data);
+      const dir = path.dirname(DB_PATH);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
       fs.writeFileSync(DB_PATH, buffer);
     } catch (e) {
       console.error('[DB] Save error:', e.message);
@@ -128,7 +132,11 @@ function initSchema() {
       email TEXT NOT NULL,
       role TEXT DEFAULT 'responder',
       avatar_color TEXT DEFAULT '#6366f1',
+      password_hash TEXT,
+      salt TEXT,
+      is_active INTEGER DEFAULT 1,
       created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (organization_id) REFERENCES organizations(id)
     );
 
@@ -365,7 +373,31 @@ function initSchema() {
       link TEXT,
       created_at TEXT DEFAULT (datetime('now'))
     );
+
+    CREATE TABLE IF NOT EXISTS sessions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      expires_at TEXT NOT NULL,
+      last_active_at TEXT DEFAULT (datetime('now')),
+      user_agent TEXT,
+      ip_address TEXT,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS password_reset_tokens (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      token_hash TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      used_at TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
   `);
+
+  // Migrate existing users table if columns are missing
+  migrateUsersTable();
 
   // Create indexes
   const indexes = [
@@ -380,9 +412,44 @@ function initSchema() {
     'CREATE INDEX IF NOT EXISTS idx_deliveries_incident ON deliveries(incident_id)',
     'CREATE INDEX IF NOT EXISTS idx_audit_logs_org ON audit_logs(organization_id)',
     'CREATE INDEX IF NOT EXISTS idx_app_notifications_org ON app_notifications(organization_id)',
+    'CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)',
+    'CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)',
+    'CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at)',
+    'CREATE INDEX IF NOT EXISTS idx_pwd_reset_user_id ON password_reset_tokens(user_id)',
+    'CREATE INDEX IF NOT EXISTS idx_pwd_reset_token_hash ON password_reset_tokens(token_hash)',
   ];
   for (const idx of indexes) {
-    rawDb.run(idx);
+    try {
+      rawDb.run(idx);
+    } catch (e) {
+      console.warn('[DB] Index creation warning:', e.message);
+    }
+  }
+}
+
+function migrateUsersTable() {
+  try {
+    const cols = [];
+    const stmt = rawDb.prepare("PRAGMA table_info(users)");
+    while (stmt.step()) {
+      cols.push(stmt.getAsObject().name);
+    }
+    stmt.free();
+
+    if (!cols.includes('password_hash')) {
+      rawDb.run("ALTER TABLE users ADD COLUMN password_hash TEXT");
+    }
+    if (!cols.includes('salt')) {
+      rawDb.run("ALTER TABLE users ADD COLUMN salt TEXT");
+    }
+    if (!cols.includes('is_active')) {
+      rawDb.run("ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1");
+    }
+    if (!cols.includes('updated_at')) {
+      rawDb.run("ALTER TABLE users ADD COLUMN updated_at TEXT");
+    }
+  } catch (err) {
+    console.error('[DB] Error migrating users table:', err.message);
   }
 }
 

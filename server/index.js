@@ -7,25 +7,176 @@ import { processEvent, addTimelineEvent, addAuditLog, addAppNotification, cancel
 import { checkRuleConflicts } from './engine/rules.js';
 import { dispatchNotifications } from './notifications/dispatcher.js';
 import { v4 as uuidv4 } from 'uuid';
+import {
+  normalizeEmail,
+  validateEmail,
+  validatePassword,
+  hashPassword,
+  verifyPassword,
+  sanitizeUser,
+  createSession,
+  getSession,
+  deleteSession,
+  deleteUserSessions,
+  cleanExpiredSessions,
+  setSessionCookie,
+  clearSessionCookie,
+  parseSessionCookie,
+  createPasswordResetToken,
+  verifyPasswordResetToken,
+  consumePasswordResetToken,
+  loginLimiter,
+  registerLimiter,
+  resetLimiter,
+  COOKIE_NAME,
+  PASSWORD_MIN_LENGTH,
+  DEFAULT_ORG_ID,
+} from './auth.js';
 
 const app = express();
 const wsClients = new Set();
+const activeSessionsToSockets = new Map();
 let server = null;
 let wss = null;
 
+const PORT = process.env.PORT || 3001;
+const ORG_ID = DEFAULT_ORG_ID;
+
+// Allowed frontend origins for CORS and WebSocket handshake
+const allowedOrigins = [
+  'https://alertflow-two.vercel.app',
+  'http://localhost:5173',
+  'http://localhost:3000',
+  'http://127.0.0.1:5173',
+  ...(process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim()) : []),
+  ...(process.env.FRONTEND_URL ? [process.env.FRONTEND_URL.trim()] : []),
+];
+
+export function isAllowedOrigin(origin) {
+  if (!origin) return true; // Direct server-to-server or same-origin
+  if (process.env.NODE_ENV !== 'production') return true;
+  try {
+    const originUrl = new URL(origin);
+    const originHost = originUrl.hostname;
+    if (origin.endsWith('.vercel.app') || originHost === 'localhost' || originHost === '127.0.0.1') {
+      return true;
+    }
+    return allowedOrigins.some(o => o.toLowerCase() === origin.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+// ==========================================
+// WEBSOCKET SERVER WITH AUTHENTICATION
+// ==========================================
+
+export function terminateSessionSockets(sessionId) {
+  if (!sessionId) return;
+  const set = activeSessionsToSockets.get(sessionId);
+  if (set) {
+    for (const ws of set) {
+      try {
+        ws.close(1008, 'Session revoked or expired');
+      } catch {}
+    }
+    activeSessionsToSockets.delete(sessionId);
+  }
+}
+
 if (!process.env.VERCEL) {
   server = http.createServer(app);
-  wss = new WebSocketServer({ server, path: '/ws' });
+  wss = new WebSocketServer({ noServer: true });
+
+  server.on('upgrade', async (request, socket, head) => {
+    try {
+      const parsedUrl = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
+      if (parsedUrl.pathname !== '/ws') {
+        socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+
+      // 1. Origin validation
+      const origin = request.headers.origin;
+      if (origin && !isAllowedOrigin(origin)) {
+        console.warn(`[WS] Rejected connection from untrusted origin: ${origin}`);
+        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+
+      // 2. Session validation via cookie
+      const cookieHeader = request.headers.cookie;
+      const sessionId = parseSessionCookie(cookieHeader);
+      if (!sessionId) {
+        console.warn('[WS] Rejected connection: Missing session cookie');
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+
+      await waitForDb();
+      const db = getDb();
+      const sessionResult = getSession(db, sessionId);
+
+      if (!sessionResult || !sessionResult.user) {
+        console.warn('[WS] Rejected connection: Invalid or expired session');
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        ws.user = sessionResult.user;
+        ws.sessionId = sessionResult.session.id;
+        wss.emit('connection', ws, request);
+      });
+    } catch (err) {
+      console.error('[WS] Upgrade handling error:', err.message);
+      socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
+      socket.destroy();
+    }
+  });
+
   wss.on('connection', (ws) => {
     wsClients.add(ws);
-    ws.on('close', () => wsClients.delete(ws));
+    if (!activeSessionsToSockets.has(ws.sessionId)) {
+      activeSessionsToSockets.set(ws.sessionId, new Set());
+    }
+    activeSessionsToSockets.get(ws.sessionId).add(ws);
+
+    ws.on('close', () => {
+      wsClients.delete(ws);
+      const set = activeSessionsToSockets.get(ws.sessionId);
+      if (set) {
+        set.delete(ws);
+        if (set.size === 0) activeSessionsToSockets.delete(ws.sessionId);
+      }
+    });
   });
 }
 
-app.use(cors());
-app.use(express.json());
+// ==========================================
+// CORS & MIDDLEWARE
+// ==========================================
 
-// Ensure database is ready before handling requests (required for serverless)
+app.use(cors({
+  origin: (origin, callback) => {
+    if (isAllowedOrigin(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('CORS request rejected: Origin not allowed'));
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-AlertFlow-Client'],
+}));
+
+app.use(express.json({ limit: '1mb' }));
+
+// Ensure database is ready before handling requests
 app.use(async (req, res, next) => {
   try {
     await waitForDb();
@@ -35,10 +186,70 @@ app.use(async (req, res, next) => {
   }
 });
 
-const PORT = process.env.PORT || 3001;
-const ORG_ID = 'org-default';
+// Periodic session cleanup
+setInterval(() => {
+  try {
+    const db = getDb();
+    cleanExpiredSessions(db);
+  } catch {}
+}, 60 * 60 * 1000).unref();
 
+// CSRF validation for state-changing browser requests
+app.use((req, res, next) => {
+  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+    return next();
+  }
+  // Public webhook ingestion does not use cookies and is exempt from origin check
+  if (req.path === '/api/webhook/ingest') {
+    return next();
+  }
 
+  const origin = req.headers.origin;
+  if (origin && !isAllowedOrigin(origin)) {
+    return res.status(403).json({ error: 'Forbidden: CSRF validation failed' });
+  }
+  next();
+});
+
+// Session identification middleware (populates req.user and req.session)
+app.use((req, res, next) => {
+  const sessionId = parseSessionCookie(req.headers.cookie) || (
+    req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : null
+  );
+
+  if (sessionId) {
+    try {
+      const db = getDb();
+      const result = getSession(db, sessionId);
+      if (result) {
+        req.user = result.user;
+        req.session = result.session;
+      }
+    } catch (err) {
+      console.error('[Auth] Error looking up session:', err.message);
+    }
+  }
+  next();
+});
+
+// Authentication enforcement middleware
+export function requireAuth(req, res, next) {
+  if (!req.user) {
+    return res.status(401).json({ error: 'Unauthorized: Authentication required' });
+  }
+  next();
+}
+
+// Role authorization middleware
+export function requireAdmin(req, res, next) {
+  if (!req.user) {
+    return res.status(401).json({ error: 'Unauthorized: Authentication required' });
+  }
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Forbidden: Administrator privileges required' });
+  }
+  next();
+}
 
 export function broadcast(data) {
   const msg = JSON.stringify(data);
@@ -50,11 +261,330 @@ export function broadcast(data) {
 }
 
 // ==========================================
+// HEALTH CHECKS
+// ==========================================
+
+app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
+app.get('/api/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
+
+// ==========================================
+// AUTHENTICATION API
+// ==========================================
+
+// Config (public endpoint indicating if registration is enabled)
+app.get('/api/auth/config', (req, res) => {
+  const registrationEnabled = process.env.ALLOW_REGISTRATION !== 'false';
+  res.json({
+    registrationEnabled,
+    passwordMinLength: PASSWORD_MIN_LENGTH,
+  });
+});
+
+// Register
+app.post('/api/auth/register', async (req, res) => {
+  const registrationEnabled = process.env.ALLOW_REGISTRATION !== 'false';
+  if (!registrationEnabled) {
+    return res.status(403).json({ error: 'Public registration is currently disabled' });
+  }
+
+  const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+  if (registerLimiter.isLimited(clientIp)) {
+    return res.status(429).json({ error: 'Too many registration attempts. Please try again later.' });
+  }
+
+  const { name, email, password } = req.body || {};
+
+  if (!name || typeof name !== 'string' || name.trim().length === 0) {
+    return res.status(400).json({ error: 'Name is required' });
+  }
+
+  const normalizedEmail = normalizeEmail(email);
+  if (!validateEmail(normalizedEmail)) {
+    return res.status(400).json({ error: 'A valid email address is required' });
+  }
+
+  const passCheck = validatePassword(password);
+  if (!passCheck.valid) {
+    return res.status(400).json({ error: passCheck.error });
+  }
+
+  const db = getDb();
+
+  // Check duplicate email
+  const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(normalizedEmail);
+  if (existing) {
+    registerLimiter.recordAttempt(clientIp);
+    return res.status(400).json({ error: 'An account with this email address already exists' });
+  }
+
+  try {
+    const passwordHash = await hashPassword(password);
+    const userId = `user-${uuidv4().slice(0, 8)}`;
+    const now = new Date().toISOString();
+
+    // Check if this is the very first registered user with password
+    const adminCountRow = db.prepare(`SELECT COUNT(*) as c FROM users WHERE role = 'admin' AND password_hash IS NOT NULL`).get();
+    const role = (adminCountRow?.c === 0) ? 'admin' : 'member';
+
+    const avatarColors = ['#6366f1', '#ec4899', '#10b981', '#f59e0b', '#8b5cf6', '#06b6d4', '#f43f5e'];
+    const avatarColor = avatarColors[Math.floor(Math.random() * avatarColors.length)];
+
+    db.prepare(`
+      INSERT INTO users (id, organization_id, name, email, role, avatar_color, password_hash, is_active, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+    `).run(userId, ORG_ID, name.trim(), normalizedEmail, role, avatarColor, passwordHash, now, now);
+
+    db.save();
+
+    // Create session for immediate login
+    const session = createSession(db, userId, {
+      userAgent: req.headers['user-agent'] || '',
+      ipAddress: clientIp,
+    });
+    setSessionCookie(res, session.id);
+
+    const newUser = {
+      id: userId,
+      organization_id: ORG_ID,
+      name: name.trim(),
+      email: normalizedEmail,
+      role,
+      avatar_color: avatarColor,
+      created_at: now,
+    };
+
+    addAuditLog(db, 'user_registered', 'user', userId, newUser.name, `New user registered: ${newUser.name}`, userId, newUser.name);
+
+    res.status(201).json({
+      success: true,
+      user: sanitizeUser(newUser),
+    });
+  } catch (err) {
+    console.error('[Auth] Registration error:', err);
+    res.status(500).json({ error: 'Registration failed due to a server error' });
+  }
+});
+
+// Login
+app.post('/api/auth/login', async (req, res) => {
+  const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+  if (loginLimiter.isLimited(clientIp)) {
+    return res.status(429).json({ error: 'Too many failed login attempts. Please try again in 15 minutes.' });
+  }
+
+  const { email, password } = req.body || {};
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email and password are required' });
+  }
+
+  const normalizedEmail = normalizeEmail(email);
+  const db = getDb();
+
+  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(normalizedEmail);
+
+  // Generic authentication error message to prevent account enumeration
+  const invalidError = 'Invalid email or password';
+
+  if (!user || !user.password_hash || user.is_active === 0) {
+    loginLimiter.recordAttempt(clientIp);
+    return res.status(401).json({ error: invalidError });
+  }
+
+  const isValidPassword = await verifyPassword(password, user.password_hash);
+  if (!isValidPassword) {
+    loginLimiter.recordAttempt(clientIp);
+    return res.status(401).json({ error: invalidError });
+  }
+
+  // Success: reset rate limiter
+  loginLimiter.reset(clientIp);
+
+  // Invalidate any old session if cookie present
+  const oldSessionId = parseSessionCookie(req.headers.cookie);
+  if (oldSessionId) {
+    deleteSession(db, oldSessionId);
+    terminateSessionSockets(oldSessionId);
+  }
+
+  // Generate new persistent session
+  const session = createSession(db, user.id, {
+    userAgent: req.headers['user-agent'] || '',
+    ipAddress: clientIp,
+  });
+
+  setSessionCookie(res, session.id);
+
+  addAuditLog(db, 'user_login', 'user', user.id, user.name, 'User logged in', user.id, user.name);
+
+  res.json({
+    success: true,
+    user: sanitizeUser(user),
+  });
+});
+
+// Logout
+app.post('/api/auth/logout', (req, res) => {
+  const sessionId = parseSessionCookie(req.headers.cookie) || (
+    req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : null
+  );
+
+  if (sessionId) {
+    try {
+      const db = getDb();
+      deleteSession(db, sessionId);
+      terminateSessionSockets(sessionId);
+    } catch (e) {
+      console.error('[Auth] Error invalidating session on logout:', e.message);
+    }
+  }
+
+  clearSessionCookie(res);
+  res.json({ success: true, message: 'Logged out successfully' });
+});
+
+// Current user profile
+app.get('/api/auth/me', (req, res) => {
+  if (!req.user) {
+    return res.status(401).json({ error: 'Unauthenticated' });
+  }
+  res.json({
+    authenticated: true,
+    user: sanitizeUser(req.user),
+  });
+});
+
+// Forgot password
+app.post('/api/auth/forgot-password', async (req, res) => {
+  const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+  if (resetLimiter.isLimited(clientIp)) {
+    return res.status(429).json({ error: 'Too many password reset requests. Please try again later.' });
+  }
+
+  const { email } = req.body || {};
+  const genericResponse = {
+    success: true,
+    message: 'If an account exists with this email address, password reset instructions have been sent.',
+  };
+
+  if (!email || !validateEmail(email)) {
+    return res.json(genericResponse);
+  }
+
+  const normalizedEmail = normalizeEmail(email);
+  const db = getDb();
+  const user = db.prepare('SELECT * FROM users WHERE email = ? AND is_active = 1').get(normalizedEmail);
+
+  if (!user) {
+    resetLimiter.recordAttempt(clientIp);
+    return res.json(genericResponse);
+  }
+
+  try {
+    const { rawToken } = createPasswordResetToken(db, user.id);
+    db.save();
+
+    const frontendOrigin = req.headers.origin || process.env.FRONTEND_URL || 'https://alertflow-two.vercel.app';
+    const resetUrl = `${frontendOrigin}/reset-password?token=${rawToken}`;
+
+    // Check if an email notification destination or SMTP is configured
+    const emailDest = db.prepare(`SELECT * FROM destinations WHERE type = 'email' AND enabled = 1`).get();
+    let emailSent = false;
+
+    if (emailDest || process.env.SMTP_HOST || process.env.EMAIL_USER) {
+      try {
+        const { sendEmailNotification } = await import('./notifications/email.js');
+        let config = {};
+        if (emailDest) {
+          config = typeof emailDest.configuration === 'string' ? JSON.parse(emailDest.configuration) : emailDest.configuration;
+        } else {
+          config = {
+            smtp_host: process.env.SMTP_HOST,
+            smtp_port: parseInt(process.env.SMTP_PORT, 10) || 587,
+            smtp_user: process.env.SMTP_USER,
+            smtp_pass: process.env.SMTP_PASS,
+            email: process.env.EMAIL_USER,
+            from_email: process.env.EMAIL_FROM || 'noreply@alertflow.io',
+          };
+        }
+
+        const template = {
+          subject: 'AlertFlow Password Reset',
+          service: 'AlertFlow Auth',
+          environment: 'Security',
+          description: `A password reset was requested for your AlertFlow account. Click the link to reset your password (valid for 1 hour):\n\n${resetUrl}`,
+          severity: 'info',
+        };
+
+        await sendEmailNotification({ ...config, to_email: user.email }, template, { title: 'Password Reset', severity: 'info', incident_number: 'AUTH' });
+        emailSent = true;
+      } catch (err) {
+        console.error('[Auth] Error sending reset email:', err.message);
+      }
+    }
+
+    if (!emailSent) {
+      console.log(`[Auth] Password reset token generated for ${user.email} (valid 1 hour). Configure SMTP or Email destination for automated email delivery.`);
+    }
+
+    addAuditLog(db, 'password_reset_requested', 'user', user.id, user.name, 'Password reset requested', user.id, user.name);
+  } catch (err) {
+    console.error('[Auth] Forgot password error:', err.message);
+  }
+
+  res.json(genericResponse);
+});
+
+// Reset password
+app.post('/api/auth/reset-password', async (req, res) => {
+  const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+  if (resetLimiter.isLimited(clientIp)) {
+    return res.status(429).json({ error: 'Too many password reset attempts. Please try again later.' });
+  }
+
+  const { token, password } = req.body || {};
+  if (!token || !password) {
+    return res.status(400).json({ error: 'Token and new password are required' });
+  }
+
+  const passCheck = validatePassword(password);
+  if (!passCheck.valid) {
+    return res.status(400).json({ error: passCheck.error });
+  }
+
+  const db = getDb();
+  const tokenRecord = verifyPasswordResetToken(db, token);
+  if (!tokenRecord) {
+    resetLimiter.recordAttempt(clientIp);
+    return res.status(400).json({ error: 'Invalid or expired password reset token' });
+  }
+
+  try {
+    const passwordHash = await hashPassword(password);
+    const success = consumePasswordResetToken(db, token, passwordHash);
+
+    if (!success) {
+      return res.status(400).json({ error: 'Invalid or expired password reset token' });
+    }
+
+    db.save();
+    addAuditLog(db, 'password_reset_completed', 'user', tokenRecord.user_id, tokenRecord.name, 'Password was reset successfully', tokenRecord.user_id, tokenRecord.name);
+
+    res.json({
+      success: true,
+      message: 'Your password has been reset successfully. You can now log in with your new password.',
+    });
+  } catch (err) {
+    console.error('[Auth] Reset password error:', err);
+    res.status(500).json({ error: 'Password reset failed due to a server error' });
+  }
+});
+
+// ==========================================
 // EVENTS / PIPELINE
 // ==========================================
 
-// Event simulator / webhook ingestion
-app.post('/api/events', async (req, res) => {
+// Event simulator / webhook ingestion (authenticated)
+app.post('/api/events', requireAuth, async (req, res) => {
   try {
     const result = await processEvent(req.body);
     res.json(result);
@@ -64,7 +594,7 @@ app.post('/api/events', async (req, res) => {
   }
 });
 
-// External webhook endpoint (same pipeline)
+// External webhook endpoint (open for monitoring integrations like Datadog, Grafana)
 app.post('/api/webhook/ingest', async (req, res) => {
   try {
     const result = await processEvent(req.body);
@@ -78,7 +608,7 @@ app.post('/api/webhook/ingest', async (req, res) => {
 // DASHBOARD
 // ==========================================
 
-app.get('/api/dashboard', (req, res) => {
+app.get('/api/dashboard', requireAuth, (req, res) => {
   const db = getDb();
 
   const openIncidents = db.prepare(`SELECT COUNT(*) as c FROM incidents WHERE status NOT IN ('resolved') AND organization_id = ?`).get(ORG_ID).c;
@@ -167,7 +697,7 @@ app.get('/api/dashboard', (req, res) => {
 // INCIDENTS
 // ==========================================
 
-app.get('/api/incidents', (req, res) => {
+app.get('/api/incidents', requireAuth, (req, res) => {
   const db = getDb();
   const { status, severity, priority, team, service, environment, search, limit = 50 } = req.query;
 
@@ -202,7 +732,7 @@ app.get('/api/incidents', (req, res) => {
   res.json(incidents);
 });
 
-app.get('/api/incidents/:id', (req, res) => {
+app.get('/api/incidents/:id', requireAuth, (req, res) => {
   const db = getDb();
   const incident = db.prepare(`
     SELECT i.*, s.name as service_name, t.name as team_name, u.name as assignee_name
@@ -246,9 +776,9 @@ app.get('/api/incidents/:id', (req, res) => {
 });
 
 // Incident actions
-app.post('/api/incidents/:id/acknowledge', (req, res) => {
+app.post('/api/incidents/:id/acknowledge', requireAuth, (req, res) => {
   const db = getDb();
-  const { user_id = 'user-ahmed' } = req.body;
+  const userId = req.user?.id || req.body.user_id || 'user-ahmed';
   const now = new Date().toISOString();
 
   const incident = db.prepare('SELECT * FROM incidents WHERE id = ?').get(req.params.id);
@@ -257,12 +787,12 @@ app.post('/api/incidents/:id/acknowledge', (req, res) => {
   db.prepare('UPDATE incidents SET status = ?, acknowledged_at = ?, updated_at = ? WHERE id = ?')
     .run('acknowledged', now, now, req.params.id);
 
-  const user = db.prepare('SELECT name FROM users WHERE id = ?').get(user_id);
-  const userName = user?.name || 'Unknown';
+  const user = db.prepare('SELECT name FROM users WHERE id = ?').get(userId);
+  const userName = req.user?.name || user?.name || 'Unknown';
 
   addTimelineEvent(db, req.params.id, 'acknowledged', `Acknowledged by ${userName}`);
   cancelEscalation(req.params.id);
-  addAuditLog(db, 'incident_acknowledged', 'incident', req.params.id, `INC-${incident.incident_number}`, `Acknowledged by ${userName}`, user_id, userName);
+  addAuditLog(db, 'incident_acknowledged', 'incident', req.params.id, `INC-${incident.incident_number}`, `Acknowledged by ${userName}`, userId, userName);
   addAppNotification(db, 'incident_acknowledged', 'Incident Acknowledged', `INC-${incident.incident_number} acknowledged by ${userName}`, 'info', `/incidents/${req.params.id}`);
 
   const updated = db.prepare('SELECT * FROM incidents WHERE id = ?').get(req.params.id);
@@ -272,9 +802,10 @@ app.post('/api/incidents/:id/acknowledge', (req, res) => {
   res.json({ success: true, incident: updated });
 });
 
-app.post('/api/incidents/:id/resolve', async (req, res) => {
+app.post('/api/incidents/:id/resolve', requireAuth, async (req, res) => {
   const db = getDb();
-  const { user_id = 'user-ahmed', root_cause, impact, resolution, followup } = req.body;
+  const userId = req.user?.id || req.body.user_id || 'user-ahmed';
+  const { root_cause, impact, resolution, followup } = req.body;
   const now = new Date().toISOString();
 
   const incident = db.prepare(`
@@ -288,8 +819,8 @@ app.post('/api/incidents/:id/resolve', async (req, res) => {
   db.prepare('UPDATE incidents SET status = ?, resolved_at = ?, updated_at = ?, root_cause = ?, impact = ?, resolution = ?, followup = ? WHERE id = ?')
     .run('resolved', now, now, root_cause || null, impact || null, resolution || null, followup || null, req.params.id);
 
-  const user = db.prepare('SELECT name FROM users WHERE id = ?').get(user_id);
-  const userName = user?.name || 'Unknown';
+  const user = db.prepare('SELECT name FROM users WHERE id = ?').get(userId);
+  const userName = req.user?.name || user?.name || 'Unknown';
 
   addTimelineEvent(db, req.params.id, 'resolved', `Resolved by ${userName}`);
   cancelEscalation(req.params.id);
@@ -302,7 +833,7 @@ app.post('/api/incidents/:id/resolve', async (req, res) => {
     }
   }
 
-  addAuditLog(db, 'incident_resolved', 'incident', req.params.id, `INC-${incident.incident_number}`, `Resolved by ${userName}`, user_id, userName);
+  addAuditLog(db, 'incident_resolved', 'incident', req.params.id, `INC-${incident.incident_number}`, `Resolved by ${userName}`, userId, userName);
   addAppNotification(db, 'incident_resolved', 'Incident Resolved', `INC-${incident.incident_number} resolved by ${userName}`, 'success', `/incidents/${req.params.id}`);
 
   // Send recovery notifications with explicit recovery metadata
@@ -338,9 +869,10 @@ app.post('/api/incidents/:id/resolve', async (req, res) => {
   res.json({ success: true, incident: updatedIncident });
 });
 
-app.post('/api/incidents/:id/assign', (req, res) => {
+app.post('/api/incidents/:id/assign', requireAuth, (req, res) => {
   const db = getDb();
-  const { team_id, assignee_id, user_id = 'user-ahmed' } = req.body;
+  const userId = req.user?.id || req.body.user_id || 'user-ahmed';
+  const { team_id, assignee_id } = req.body;
   const now = new Date().toISOString();
 
   const incident = db.prepare('SELECT * FROM incidents WHERE id = ?').get(req.params.id);
@@ -358,11 +890,11 @@ app.post('/api/incidents/:id/assign', (req, res) => {
 
   if (assignee_id) {
     const assignee = db.prepare('SELECT name FROM users WHERE id = ?').get(assignee_id);
-    addTimelineEvent(db, req.params.id, 'assigned', `Assigned to ${assignee?.name || 'Unknown'}`, user_id);
+    addTimelineEvent(db, req.params.id, 'assigned', `Assigned to ${assignee?.name || 'Unknown'}`, userId);
   }
   if (team_id) {
     const team = db.prepare('SELECT name FROM teams WHERE id = ?').get(team_id);
-    addTimelineEvent(db, req.params.id, 'team_assigned', `Reassigned to ${team?.name || 'Unknown'} team`, user_id);
+    addTimelineEvent(db, req.params.id, 'team_assigned', `Reassigned to ${team?.name || 'Unknown'} team`, userId);
   }
 
   const updated = db.prepare(`SELECT i.*, s.name as service_name, t.name as team_name, u.name as assignee_name FROM incidents i LEFT JOIN services s ON i.service_id = s.id LEFT JOIN teams t ON i.team_id = t.id LEFT JOIN users u ON i.assignee_id = u.id WHERE i.id = ?`).get(req.params.id);
@@ -371,7 +903,7 @@ app.post('/api/incidents/:id/assign', (req, res) => {
   res.json({ success: true, incident: updated });
 });
 
-app.post('/api/incidents/:id/escalate', async (req, res) => {
+app.post('/api/incidents/:id/escalate', requireAuth, async (req, res) => {
   const db = getDb();
   const now = new Date().toISOString();
 
@@ -386,7 +918,7 @@ app.post('/api/incidents/:id/escalate', async (req, res) => {
   res.json({ success: true });
 });
 
-app.post('/api/incidents/:id/reopen', (req, res) => {
+app.post('/api/incidents/:id/reopen', requireAuth, (req, res) => {
   const db = getDb();
   const now = new Date().toISOString();
 
@@ -400,33 +932,37 @@ app.post('/api/incidents/:id/reopen', (req, res) => {
   res.json({ success: true, incident: updated });
 });
 
-app.post('/api/incidents/:id/status', (req, res) => {
+app.post('/api/incidents/:id/status', requireAuth, (req, res) => {
   const db = getDb();
-  const { status, user_id = 'user-ahmed' } = req.body;
+  const userId = req.user?.id || req.body.user_id || 'user-ahmed';
+  const { status } = req.body;
   const now = new Date().toISOString();
 
   db.prepare('UPDATE incidents SET status = ?, updated_at = ? WHERE id = ?').run(status, now, req.params.id);
-  const user = db.prepare('SELECT name FROM users WHERE id = ?').get(user_id);
-  addTimelineEvent(db, req.params.id, 'status_changed', `Status changed to ${status} by ${user?.name || 'Unknown'}`, user_id);
+  const user = db.prepare('SELECT name FROM users WHERE id = ?').get(userId);
+  const userName = req.user?.name || user?.name || 'Unknown';
+  addTimelineEvent(db, req.params.id, 'status_changed', `Status changed to ${status} by ${userName}`, userId);
 
   const updated = db.prepare('SELECT * FROM incidents WHERE id = ?').get(req.params.id);
   broadcast({ type: 'incident_updated', incident: updated });
   res.json({ success: true, incident: updated });
 });
 
-app.post('/api/incidents/:id/notes', (req, res) => {
+app.post('/api/incidents/:id/notes', requireAuth, (req, res) => {
   const db = getDb();
-  const { message, user_id = 'user-ahmed' } = req.body;
+  const userId = req.user?.id || req.body.user_id || 'user-ahmed';
+  const { message } = req.body;
 
-  const user = db.prepare('SELECT name FROM users WHERE id = ?').get(user_id);
-  addTimelineEvent(db, req.params.id, 'note', `${user?.name || 'Unknown'}: ${message}`, user_id);
+  const user = db.prepare('SELECT name FROM users WHERE id = ?').get(userId);
+  const userName = req.user?.name || user?.name || 'Unknown';
+  addTimelineEvent(db, req.params.id, 'note', `${userName}: ${message}`, userId);
 
   const updated = db.prepare('SELECT * FROM incidents WHERE id = ?').get(req.params.id);
   broadcast({ type: 'incident_updated', incident: updated });
   res.json({ success: true });
 });
 
-app.post('/api/incidents/:id/postmortem', (req, res) => {
+app.post('/api/incidents/:id/postmortem', requireAuth, (req, res) => {
   const db = getDb();
   const { root_cause, impact, resolution, followup } = req.body;
   const now = new Date().toISOString();
@@ -441,7 +977,7 @@ app.post('/api/incidents/:id/postmortem', (req, res) => {
 // ALERTS
 // ==========================================
 
-app.get('/api/alerts', (req, res) => {
+app.get('/api/alerts', requireAuth, (req, res) => {
   const db = getDb();
   const { source, severity, service, environment, status, search, limit = 100 } = req.query;
 
@@ -472,7 +1008,7 @@ app.get('/api/alerts', (req, res) => {
 // SERVICES
 // ==========================================
 
-app.get('/api/services', (req, res) => {
+app.get('/api/services', requireAuth, (req, res) => {
   const db = getDb();
   const today = new Date().toISOString().split('T')[0];
 
@@ -489,7 +1025,7 @@ app.get('/api/services', (req, res) => {
   res.json(services);
 });
 
-app.get('/api/services/:id', (req, res) => {
+app.get('/api/services/:id', requireAuth, (req, res) => {
   const db = getDb();
   const service = db.prepare(`
     SELECT s.*, t.name as team_name
@@ -519,7 +1055,7 @@ app.get('/api/services/:id', (req, res) => {
 // TEAMS
 // ==========================================
 
-app.get('/api/teams', (req, res) => {
+app.get('/api/teams', requireAuth, (req, res) => {
   const db = getDb();
   const teams = db.prepare(`
     SELECT t.*,
@@ -532,7 +1068,7 @@ app.get('/api/teams', (req, res) => {
   // Get members and on-call for each team
   for (const team of teams) {
     team.members = db.prepare(`
-      SELECT u.*, tm.role as team_role
+      SELECT u.id, u.organization_id, u.name, u.email, u.role, u.avatar_color, tm.role as team_role
       FROM team_members tm JOIN users u ON tm.user_id = u.id
       WHERE tm.team_id = ?
     `).all(team.id);
@@ -542,8 +1078,8 @@ app.get('/api/teams', (req, res) => {
       const members = JSON.parse(oncall.members || '[]');
       const currentIdx = oncall.current_index || 0;
       if (members.length > 0) {
-        const primaryUser = db.prepare('SELECT * FROM users WHERE id = ?').get(members[currentIdx % members.length]);
-        const secondaryUser = members.length > 1 ? db.prepare('SELECT * FROM users WHERE id = ?').get(members[(currentIdx + 1) % members.length]) : null;
+        const primaryUser = db.prepare('SELECT id, name, email, role, avatar_color FROM users WHERE id = ?').get(members[currentIdx % members.length]);
+        const secondaryUser = members.length > 1 ? db.prepare('SELECT id, name, email, role, avatar_color FROM users WHERE id = ?').get(members[(currentIdx + 1) % members.length]) : null;
         team.oncall = { primary: primaryUser, secondary: secondaryUser, schedule: oncall };
       }
     }
@@ -556,7 +1092,7 @@ app.get('/api/teams', (req, res) => {
 // DESTINATIONS
 // ==========================================
 
-app.get('/api/destinations', (req, res) => {
+app.get('/api/destinations', requireAuth, (req, res) => {
   const db = getDb();
   const destinations = db.prepare(`SELECT * FROM destinations WHERE organization_id = ? ORDER BY created_at DESC`).all(ORG_ID);
 
@@ -577,7 +1113,7 @@ app.get('/api/destinations', (req, res) => {
   res.json(masked);
 });
 
-app.post('/api/destinations', (req, res) => {
+app.post('/api/destinations', requireAuth, requireAdmin, (req, res) => {
   const db = getDb();
   const { type, name, configuration } = req.body;
   const id = uuidv4();
@@ -586,13 +1122,13 @@ app.post('/api/destinations', (req, res) => {
   db.prepare(`INSERT INTO destinations (id, organization_id, type, name, status, enabled, configuration) VALUES (?, ?, ?, ?, ?, ?, ?)`)
     .run(id, ORG_ID, type, name, 'connected', 1, configStr);
 
-  addAuditLog(db, 'destination_connected', 'destination', id, name, `${type} destination connected`);
+  addAuditLog(db, 'destination_connected', 'destination', id, name, `${type} destination connected`, req.user?.id, req.user?.name);
   addAppNotification(db, 'destination_connected', 'Destination Connected', `${name} (${type}) connected successfully`, 'success');
 
   res.json({ success: true, id });
 });
 
-app.put('/api/destinations/:id', (req, res) => {
+app.put('/api/destinations/:id', requireAuth, requireAdmin, (req, res) => {
   const db = getDb();
   const { name, configuration, enabled } = req.body;
 
@@ -610,17 +1146,17 @@ app.put('/api/destinations/:id', (req, res) => {
   res.json({ success: true });
 });
 
-app.delete('/api/destinations/:id', (req, res) => {
+app.delete('/api/destinations/:id', requireAuth, requireAdmin, (req, res) => {
   const db = getDb();
   const dest = db.prepare('SELECT * FROM destinations WHERE id = ?').get(req.params.id);
 
   db.prepare('DELETE FROM destinations WHERE id = ?').run(req.params.id);
-  addAuditLog(db, 'destination_disconnected', 'destination', req.params.id, dest?.name, `${dest?.type} destination disconnected`);
+  addAuditLog(db, 'destination_disconnected', 'destination', req.params.id, dest?.name, `${dest?.type} destination disconnected`, req.user?.id, req.user?.name);
 
   res.json({ success: true });
 });
 
-app.get('/api/debug/db', (req, res) => {
+app.get('/api/debug/db', requireAuth, requireAdmin, (req, res) => {
   try {
     const db = getDb();
     const rows = db.prepare('SELECT * FROM destinations').all();
@@ -630,7 +1166,7 @@ app.get('/api/debug/db', (req, res) => {
   }
 });
 
-app.post('/api/destinations/:id/test', async (req, res) => {
+app.post('/api/destinations/:id/test', requireAuth, async (req, res) => {
   const db = getDb();
   const dest = db.prepare('SELECT * FROM destinations WHERE id = ?').get(req.params.id);
   if (!dest) return res.status(404).json({ error: 'Destination not found' });
@@ -691,16 +1227,17 @@ function maskUrl(url) {
 }
 
 // ==========================================
+// ==========================================
 // ALERT RULES
 // ==========================================
 
-app.get('/api/rules', (req, res) => {
+app.get('/api/rules', requireAuth, (req, res) => {
   const db = getDb();
   const rules = db.prepare(`SELECT * FROM alert_rules WHERE organization_id = ? ORDER BY priority ASC`).all(ORG_ID);
   res.json(rules);
 });
 
-app.post('/api/rules', (req, res) => {
+app.post('/api/rules', requireAuth, requireAdmin, (req, res) => {
   const db = getDb();
   const { name, description, priority, conditions, actions, enabled = true } = req.body;
   const id = uuidv4();
@@ -708,11 +1245,11 @@ app.post('/api/rules', (req, res) => {
   db.prepare(`INSERT INTO alert_rules (id, organization_id, name, description, priority, conditions, actions, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(id, ORG_ID, name, description, priority || 50, JSON.stringify(conditions), JSON.stringify(actions), enabled ? 1 : 0);
 
-  addAuditLog(db, 'rule_created', 'alert_rule', id, name, `Rule created: ${name}`);
+  addAuditLog(db, 'rule_created', 'alert_rule', id, name, `Rule created: ${name}`, req.user?.id, req.user?.name);
   res.json({ success: true, id });
 });
 
-app.put('/api/rules/:id', (req, res) => {
+app.put('/api/rules/:id', requireAuth, requireAdmin, (req, res) => {
   const db = getDb();
   const { name, description, priority, conditions, actions, enabled } = req.body;
   const now = new Date().toISOString();
@@ -728,19 +1265,19 @@ app.put('/api/rules/:id', (req, res) => {
   params.push(req.params.id);
 
   db.prepare(`UPDATE alert_rules SET ${updates.join(', ')} WHERE id = ?`).run(...params);
-  addAuditLog(db, 'rule_updated', 'alert_rule', req.params.id, name, `Rule updated`);
+  addAuditLog(db, 'rule_updated', 'alert_rule', req.params.id, name, `Rule updated`, req.user?.id, req.user?.name);
   res.json({ success: true });
 });
 
-app.delete('/api/rules/:id', (req, res) => {
+app.delete('/api/rules/:id', requireAuth, requireAdmin, (req, res) => {
   const db = getDb();
   const rule = db.prepare('SELECT name FROM alert_rules WHERE id = ?').get(req.params.id);
   db.prepare('DELETE FROM alert_rules WHERE id = ?').run(req.params.id);
-  addAuditLog(db, 'rule_deleted', 'alert_rule', req.params.id, rule?.name, `Rule deleted`);
+  addAuditLog(db, 'rule_deleted', 'alert_rule', req.params.id, rule?.name, `Rule deleted`, req.user?.id, req.user?.name);
   res.json({ success: true });
 });
 
-app.get('/api/rules/:id/conflicts', (req, res) => {
+app.get('/api/rules/:id/conflicts', requireAuth, (req, res) => {
   const db = getDb();
   const conflicts = checkRuleConflicts(db, req.params.id);
   res.json(conflicts);
@@ -750,13 +1287,13 @@ app.get('/api/rules/:id/conflicts', (req, res) => {
 // ESCALATION POLICIES
 // ==========================================
 
-app.get('/api/escalation-policies', (req, res) => {
+app.get('/api/escalation-policies', requireAuth, (req, res) => {
   const db = getDb();
   const policies = db.prepare(`SELECT * FROM escalation_policies WHERE organization_id = ? ORDER BY name`).all(ORG_ID);
   res.json(policies);
 });
 
-app.post('/api/escalation-policies', (req, res) => {
+app.post('/api/escalation-policies', requireAuth, requireAdmin, (req, res) => {
   const db = getDb();
   const { name, description, steps, enabled = true } = req.body;
   const id = uuidv4();
@@ -764,11 +1301,11 @@ app.post('/api/escalation-policies', (req, res) => {
   db.prepare(`INSERT INTO escalation_policies (id, organization_id, name, description, steps, enabled) VALUES (?, ?, ?, ?, ?, ?)`)
     .run(id, ORG_ID, name, description, JSON.stringify(steps), enabled ? 1 : 0);
 
-  addAuditLog(db, 'escalation_policy_created', 'escalation_policy', id, name, `Escalation policy created`);
+  addAuditLog(db, 'escalation_policy_created', 'escalation_policy', id, name, `Escalation policy created`, req.user?.id, req.user?.name);
   res.json({ success: true, id });
 });
 
-app.put('/api/escalation-policies/:id', (req, res) => {
+app.put('/api/escalation-policies/:id', requireAuth, requireAdmin, (req, res) => {
   const db = getDb();
   const { name, description, steps, enabled } = req.body;
 
@@ -788,7 +1325,7 @@ app.put('/api/escalation-policies/:id', (req, res) => {
 // ON-CALL
 // ==========================================
 
-app.get('/api/oncall', (req, res) => {
+app.get('/api/oncall', requireAuth, (req, res) => {
   const db = getDb();
   const schedules = db.prepare(`
     SELECT oc.*, t.name as team_name
@@ -801,7 +1338,7 @@ app.get('/api/oncall', (req, res) => {
     const members = JSON.parse(oc.members || '[]');
     const currentIdx = oc.current_index || 0;
 
-    const resolvedMembers = members.map(uid => db.prepare('SELECT * FROM users WHERE id = ?').get(uid)).filter(Boolean);
+    const resolvedMembers = members.map(uid => db.prepare('SELECT id, name, email, role, avatar_color FROM users WHERE id = ?').get(uid)).filter(Boolean);
 
     const primary = resolvedMembers[currentIdx % resolvedMembers.length] || null;
     const secondary = resolvedMembers.length > 1 ? resolvedMembers[(currentIdx + 1) % resolvedMembers.length] : null;
@@ -821,13 +1358,13 @@ app.get('/api/oncall', (req, res) => {
 // MAINTENANCE WINDOWS
 // ==========================================
 
-app.get('/api/maintenance', (req, res) => {
+app.get('/api/maintenance', requireAuth, (req, res) => {
   const db = getDb();
   const windows = db.prepare(`SELECT * FROM maintenance_windows WHERE organization_id = ? ORDER BY start_time DESC`).all(ORG_ID);
   res.json(windows);
 });
 
-app.post('/api/maintenance', (req, res) => {
+app.post('/api/maintenance', requireAuth, requireAdmin, (req, res) => {
   const db = getDb();
   const { name, start_time, end_time, services, environments, suppression_policy = 'all' } = req.body;
   const id = uuidv4();
@@ -835,11 +1372,11 @@ app.post('/api/maintenance', (req, res) => {
   db.prepare(`INSERT INTO maintenance_windows (id, organization_id, name, start_time, end_time, services, environments, suppression_policy) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(id, ORG_ID, name, start_time, end_time, JSON.stringify(services || []), JSON.stringify(environments || []), suppression_policy);
 
-  addAuditLog(db, 'maintenance_created', 'maintenance_window', id, name, `Maintenance window created: ${name}`);
+  addAuditLog(db, 'maintenance_created', 'maintenance_window', id, name, `Maintenance window created: ${name}`, req.user?.id, req.user?.name);
   res.json({ success: true, id });
 });
 
-app.delete('/api/maintenance/:id', (req, res) => {
+app.delete('/api/maintenance/:id', requireAuth, requireAdmin, (req, res) => {
   const db = getDb();
   db.prepare('DELETE FROM maintenance_windows WHERE id = ?').run(req.params.id);
   res.json({ success: true });
@@ -849,7 +1386,7 @@ app.delete('/api/maintenance/:id', (req, res) => {
 // ANALYTICS
 // ==========================================
 
-app.get('/api/analytics', (req, res) => {
+app.get('/api/analytics', requireAuth, (req, res) => {
   const db = getDb();
 
   const totalAlerts = db.prepare(`SELECT COUNT(*) as c FROM alerts WHERE organization_id = ?`).get(ORG_ID).c;
@@ -923,7 +1460,7 @@ app.get('/api/analytics', (req, res) => {
 // AUDIT LOG
 // ==========================================
 
-app.get('/api/audit-log', (req, res) => {
+app.get('/api/audit-log', requireAuth, (req, res) => {
   const db = getDb();
   const { action, object_type, limit = 100 } = req.query;
 
@@ -944,7 +1481,7 @@ app.get('/api/audit-log', (req, res) => {
 // SEARCH
 // ==========================================
 
-app.get('/api/search', (req, res) => {
+app.get('/api/search', requireAuth, (req, res) => {
   const db = getDb();
   const { q } = req.query;
   if (!q) return res.json({ incidents: [], alerts: [], services: [], teams: [], rules: [] });
@@ -972,7 +1509,7 @@ app.get('/api/search', (req, res) => {
 // NOTIFICATIONS (in-app)
 // ==========================================
 
-app.get('/api/notifications', (req, res) => {
+app.get('/api/notifications', requireAuth, (req, res) => {
   const db = getDb();
   const notifications = db.prepare(`
     SELECT * FROM app_notifications WHERE organization_id = ? ORDER BY created_at DESC LIMIT 50
@@ -984,19 +1521,22 @@ app.get('/api/notifications', (req, res) => {
   res.json({ notifications, unreadCount });
 });
 
-app.post('/api/notifications/read-all', (req, res) => {
+app.post('/api/notifications/read-all', requireAuth, (req, res) => {
   const db = getDb();
   db.prepare(`UPDATE app_notifications SET read = 1 WHERE organization_id = ?`).run(ORG_ID);
   res.json({ success: true });
 });
 
 // ==========================================
-// USERS
+// USERS (Sanitized safe profiles)
 // ==========================================
 
-app.get('/api/users', (req, res) => {
+app.get('/api/users', requireAuth, (req, res) => {
   const db = getDb();
-  const users = db.prepare(`SELECT * FROM users WHERE organization_id = ?`).all(ORG_ID);
+  const users = db.prepare(`
+    SELECT id, organization_id, name, email, role, avatar_color, created_at
+    FROM users WHERE organization_id = ?
+  `).all(ORG_ID);
   res.json(users);
 });
 
@@ -1004,7 +1544,7 @@ app.get('/api/users', (req, res) => {
 // NOTIFICATION POLICIES
 // ==========================================
 
-app.get('/api/notification-policies', (req, res) => {
+app.get('/api/notification-policies', requireAuth, (req, res) => {
   const db = getDb();
   const policies = db.prepare(`SELECT * FROM notification_policies WHERE organization_id = ?`).all(ORG_ID);
   res.json(policies);
@@ -1017,6 +1557,37 @@ app.get('/api/notification-policies', (req, res) => {
 async function start() {
   await waitForDb();
   console.log('[Server] Database initialized');
+
+  // Automatic admin bootstrap from environment variables if provided
+  if (process.env.ADMIN_BOOTSTRAP_EMAIL && process.env.ADMIN_BOOTSTRAP_PASSWORD) {
+    try {
+      const email = normalizeEmail(process.env.ADMIN_BOOTSTRAP_EMAIL);
+      const name = process.env.ADMIN_BOOTSTRAP_NAME || 'AlertFlow Administrator';
+      const existing = getDb().prepare('SELECT id FROM users WHERE email = ?').get(email);
+      const hash = await hashPassword(process.env.ADMIN_BOOTSTRAP_PASSWORD);
+      const now = new Date().toISOString();
+
+      if (existing) {
+        getDb().prepare(`
+          UPDATE users
+          SET password_hash = ?, role = 'admin', is_active = 1, updated_at = ?
+          WHERE id = ?
+        `).run(hash, now, existing.id);
+        console.log(`[Server] Bootstrap admin updated: ${email}`);
+      } else {
+        const id = `user-admin-${uuidv4().slice(0, 8)}`;
+        getDb().prepare(`
+          INSERT INTO users (id, organization_id, name, email, role, avatar_color, password_hash, is_active, created_at, updated_at)
+          VALUES (?, ?, ?, ?, 'admin', '#6366f1', ?, 1, ?, ?)
+        `).run(id, ORG_ID, name, email, hash, now, now);
+        console.log(`[Server] Bootstrap admin created: ${email}`);
+      }
+      getDb().save();
+    } catch (e) {
+      console.error('[Server] Failed to auto-bootstrap admin:', e.message);
+    }
+  }
+
   if (server) {
     server.listen(PORT, () => {
       console.log(`\n  🚨 AlertOps Server running on http://localhost:${PORT}`);
@@ -1026,8 +1597,10 @@ async function start() {
   }
 }
 
-if (!process.env.VERCEL) {
+if (!process.env.VERCEL && process.env.NODE_ENV !== 'test') {
   start().catch(err => { console.error('Failed to start:', err); process.exit(1); });
 }
 
+export { server, wss, start };
 export default app;
+

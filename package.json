@@ -9,10 +9,14 @@
     "dev": "concurrently \"npm run server\" \"npm run client\"",
     "client": "vite",
     "server": "node server/index.js",
+    "test": "node --test tests/auth.test.js",
+    "bootstrap:admin": "node server/bootstrap-admin.js",
     "build": "vite build"
   },
   "dependencies": {
+    "bcryptjs": "^3.0.3",
     "concurrently": "^9.1.0",
+    "cookie": "^2.0.1",
     "cors": "^2.8.5",
     "express": "^4.21.0",
     "lucide-react": "^0.460.0",
