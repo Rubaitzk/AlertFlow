@@ -135,6 +135,12 @@ function initSchema() {
       password_hash TEXT,
       salt TEXT,
       is_active INTEGER DEFAULT 1,
+      is_demo INTEGER DEFAULT 0,
+      department TEXT,
+      title TEXT,
+      tags TEXT,
+      status TEXT DEFAULT 'available',
+      shift TEXT DEFAULT '09:00 - 17:00 UTC',
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (organization_id) REFERENCES organizations(id)
@@ -476,6 +482,24 @@ function migrateUsersTable() {
     }
     if (!cols.includes('is_active')) {
       rawDb.run("ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1");
+    }
+    if (!cols.includes('is_demo')) {
+      rawDb.run("ALTER TABLE users ADD COLUMN is_demo INTEGER DEFAULT 0");
+    }
+    if (!cols.includes('department')) {
+      rawDb.run("ALTER TABLE users ADD COLUMN department TEXT");
+    }
+    if (!cols.includes('title')) {
+      rawDb.run("ALTER TABLE users ADD COLUMN title TEXT");
+    }
+    if (!cols.includes('tags')) {
+      rawDb.run("ALTER TABLE users ADD COLUMN tags TEXT");
+    }
+    if (!cols.includes('status')) {
+      rawDb.run("ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'available'");
+    }
+    if (!cols.includes('shift')) {
+      rawDb.run("ALTER TABLE users ADD COLUMN shift TEXT DEFAULT '09:00 - 17:00 UTC'");
     }
     if (!cols.includes('updated_at')) {
       rawDb.run("ALTER TABLE users ADD COLUMN updated_at TEXT");

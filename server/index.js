@@ -3,6 +3,7 @@ import cors from 'cors';
 import { WebSocketServer } from 'ws';
 import http from 'http';
 import { getDb, waitForDb } from './db.js';
+import { seedDemoData } from './seed.js';
 import { processEvent, addTimelineEvent, addAuditLog, addAppNotification, cancelEscalation } from './engine/pipeline.js';
 import { checkRuleConflicts } from './engine/rules.js';
 import { v4 as uuidv4 } from 'uuid';
@@ -1075,19 +1076,39 @@ app.get('/api/teams', requireAuth, (req, res) => {
   // Get members and on-call for each team
   for (const team of teams) {
     team.members = db.prepare(`
-      SELECT u.id, u.organization_id, u.name, u.email, u.role, u.avatar_color, tm.role as team_role
+      SELECT u.id, u.organization_id, u.name, u.email, u.role, u.avatar_color,
+             u.department, u.title, u.tags, u.status, u.shift, u.is_demo,
+             tm.role as team_role
       FROM team_members tm JOIN users u ON tm.user_id = u.id
       WHERE tm.team_id = ?
-    `).all(team.id);
+    `).all(team.id).map(u => {
+      let parsedTags = [];
+      if (u.tags) {
+        try { parsedTags = typeof u.tags === 'string' ? JSON.parse(u.tags) : u.tags; }
+        catch { parsedTags = [u.tags]; }
+      }
+      return { ...u, tags: parsedTags };
+    });
 
     const oncall = db.prepare(`SELECT * FROM oncall_schedules WHERE team_id = ?`).get(team.id);
     if (oncall) {
       const members = JSON.parse(oncall.members || '[]');
       const currentIdx = oncall.current_index || 0;
       if (members.length > 0) {
-        const primaryUser = db.prepare('SELECT id, name, email, role, avatar_color FROM users WHERE id = ?').get(members[currentIdx % members.length]);
-        const secondaryUser = members.length > 1 ? db.prepare('SELECT id, name, email, role, avatar_color FROM users WHERE id = ?').get(members[(currentIdx + 1) % members.length]) : null;
-        team.oncall = { primary: primaryUser, secondary: secondaryUser, schedule: oncall };
+        const primaryRow = db.prepare('SELECT id, name, email, role, avatar_color, department, title, tags, status, shift, is_demo FROM users WHERE id = ?').get(members[currentIdx % members.length]);
+        const secondaryRow = members.length > 1 ? db.prepare('SELECT id, name, email, role, avatar_color, department, title, tags, status, shift, is_demo FROM users WHERE id = ?').get(members[(currentIdx + 1) % members.length]) : null;
+
+        const formatUser = (u) => {
+          if (!u) return null;
+          let parsedTags = [];
+          if (u.tags) {
+            try { parsedTags = typeof u.tags === 'string' ? JSON.parse(u.tags) : u.tags; }
+            catch { parsedTags = [u.tags]; }
+          }
+          return { ...u, tags: parsedTags };
+        };
+
+        team.oncall = { primary: formatUser(primaryRow), secondary: formatUser(secondaryRow), schedule: oncall };
       }
     }
   }
@@ -1514,7 +1535,16 @@ app.get('/api/oncall', requireAuth, (req, res) => {
     const members = JSON.parse(oc.members || '[]');
     const currentIdx = oc.current_index || 0;
 
-    const resolvedMembers = members.map(uid => db.prepare('SELECT id, name, email, role, avatar_color FROM users WHERE id = ?').get(uid)).filter(Boolean);
+    const resolvedMembers = members.map(uid => {
+      const u = db.prepare('SELECT id, name, email, role, avatar_color, department, title, tags, status, shift, is_demo FROM users WHERE id = ?').get(uid);
+      if (!u) return null;
+      let parsedTags = [];
+      if (u.tags) {
+        try { parsedTags = typeof u.tags === 'string' ? JSON.parse(u.tags) : u.tags; }
+        catch { parsedTags = [u.tags]; }
+      }
+      return { ...u, tags: parsedTags };
+    }).filter(Boolean);
 
     const primary = resolvedMembers[currentIdx % resolvedMembers.length] || null;
     const secondary = resolvedMembers.length > 1 ? resolvedMembers[(currentIdx + 1) % resolvedMembers.length] : null;
@@ -1710,10 +1740,34 @@ app.post('/api/notifications/read-all', requireAuth, (req, res) => {
 app.get('/api/users', requireAuth, (req, res) => {
   const db = getDb();
   const users = db.prepare(`
-    SELECT id, organization_id, name, email, role, avatar_color, created_at
+    SELECT id, organization_id, name, email, role, avatar_color, department, title, tags, status, shift, is_demo, created_at
     FROM users WHERE organization_id = ?
+    ORDER BY is_demo ASC, name ASC
   `).all(ORG_ID);
-  res.json(users);
+
+  const parsed = users.map(u => {
+    let parsedTags = [];
+    if (u.tags) {
+      try {
+        parsedTags = typeof u.tags === 'string' ? JSON.parse(u.tags) : u.tags;
+      } catch {
+        parsedTags = [u.tags];
+      }
+    }
+    return { ...u, tags: parsedTags };
+  });
+
+  res.json(parsed);
+});
+
+// Seed or update demo dataset on-demand (idempotent)
+app.post('/api/seed/demo', requireAuth, requireAdmin, (req, res) => {
+  try {
+    const result = seedDemoData(getDb());
+    res.json({ success: true, message: 'Demo dataset re-seeded successfully', ...result });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to seed demo data', details: err.message });
+  }
 });
 
 // ==========================================
@@ -1733,6 +1787,13 @@ app.get('/api/notification-policies', requireAuth, (req, res) => {
 async function start() {
   await waitForDb();
   console.log('[Server] Database initialized');
+
+  // Idempotently seed or update demo personnel, teams, oncall, and services
+  try {
+    seedDemoData(getDb());
+  } catch (err) {
+    console.warn('[Server] Demo data seed warning:', err.message);
+  }
 
   // Automatic admin bootstrap from environment variables if provided
   if (process.env.ADMIN_BOOTSTRAP_EMAIL && process.env.ADMIN_BOOTSTRAP_PASSWORD) {

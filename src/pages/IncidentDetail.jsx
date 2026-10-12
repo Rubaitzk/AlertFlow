@@ -359,7 +359,20 @@ export default function IncidentDetail() {
                 <label className="form-label">Assignee</label>
                 <select className="form-select" defaultValue={incident.assignee_id || ''} id="assign-user">
                   <option value="">Select responder...</option>
-                  {users.map(u => <option key={u.id} value={u.id}>{u.name}</option>)}
+                  {(() => {
+                    const depts = [...new Set(users.map(u => u.department || 'Other'))];
+                    return depts.map(dept => (
+                      <optgroup key={dept} label={`${dept} Pod`}>
+                        {users
+                          .filter(u => (u.department || 'Other') === dept)
+                          .map(u => (
+                            <option key={u.id} value={u.id}>
+                              {u.name} — {u.title || u.role} {u.is_demo ? '(Demo)' : '(Active)'}
+                            </option>
+                          ))}
+                      </optgroup>
+                    ));
+                  })()}
                 </select>
               </div>
             </div>

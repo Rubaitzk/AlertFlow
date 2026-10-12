@@ -4,6 +4,16 @@ import { sendGmailMessage, getGmailStatus } from '../connectors/gmail.js';
  * Dispatches incident notification through direct Gmail API.
  */
 export async function sendGmailNotification(db, config, template, incident, notificationType = 'alert') {
+  const targetEmail = config.to_email || config.recipient;
+  if (targetEmail && (targetEmail.endsWith('@demo.alertflow.io') || targetEmail.includes('@demo.') || targetEmail.includes('.demo@'))) {
+    console.log(`[Gmail] Suppressing dispatch to demo user: ${targetEmail}`);
+    return {
+      success: true,
+      suppressed: true,
+      message: `Demo recipient ${targetEmail} suppressed to prevent external delivery`,
+    };
+  }
+
   // Find connected Gmail account
   const organizationId = incident?.organization_id || 'org-default';
   
@@ -55,6 +65,15 @@ export async function sendGmailNotification(db, config, template, incident, noti
   }
 
   const to = config.to_email || config.recipient || connector.account_email;
+
+  if (to && (to.endsWith('@demo.alertflow.io') || to.includes('@demo.'))) {
+    console.log(`[Gmail] Suppressing dispatch to demo user: ${to}`);
+    return {
+      success: true,
+      suppressed: true,
+      message: `Demo recipient ${to} suppressed to prevent external delivery`,
+    };
+  }
 
   const result = await sendGmailMessage(db, connector, {
     to,

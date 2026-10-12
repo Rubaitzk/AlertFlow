@@ -4,6 +4,16 @@ import nodemailer from 'nodemailer';
  * Email notification sender using Nodemailer SMTP.
  */
 export async function sendEmailNotification(config, template, incident, notificationType = 'alert') {
+  const toEmail = config.to_email || config.email;
+  if (toEmail && (toEmail.endsWith('@demo.alertflow.io') || toEmail.includes('@demo.') || toEmail.includes('.demo@'))) {
+    console.log(`[Email] Suppressing dispatch to demo user: ${toEmail}`);
+    return {
+      success: true,
+      suppressed: true,
+      message: `Demo recipient ${toEmail} suppressed to prevent external delivery`,
+    };
+  }
+
   if (!config.smtp_host && !config.service) {
     return { success: false, error: 'No SMTP configuration found' };
   }
@@ -52,9 +62,19 @@ export async function sendEmailNotification(config, template, incident, notifica
       html = buildAlertEmailHtml(incident, template, severityColors);
     }
 
+    const toEmail = config.to_email || config.email;
+    if (toEmail && (toEmail.endsWith('@demo.alertflow.io') || toEmail.includes('@demo.'))) {
+      console.log(`[Email] Suppressing dispatch to demo user: ${toEmail}`);
+      return {
+        success: true,
+        suppressed: true,
+        message: `Demo recipient ${toEmail} suppressed to prevent external delivery`,
+      };
+    }
+
     const mailOptions = {
       from: config.from_email || config.email || 'alertops@acme.dev',
-      to: config.to_email || config.email,
+      to: toEmail,
       subject,
       html,
     };
